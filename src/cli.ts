@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import chalk from "chalk";
-import { init, query, path, godNodes, stats, benchmark } from "./core.js";
+import { init, query, path, godNodes, stats, benchmark, learn } from "./core.js";
 
 const program = new Command();
 
@@ -119,6 +119,20 @@ program
       console.log(`    Reduction:     ${chalk.bold.cyan(bench.reductionRatio + "x")} fewer tokens per query`);
     }
     console.log();
+  });
+
+program
+  .command("learn")
+  .description("Teach engram a decision, pattern, or lesson")
+  .argument("<text>", "What to remember (e.g., 'We chose JWT over sessions for horizontal scaling')")
+  .option("-p, --project <path>", "Project directory", ".")
+  .action(async (text: string, opts: { project: string }) => {
+    const result = await learn(opts.project, text);
+    if (result.nodesAdded > 0) {
+      console.log(chalk.green(`🧠 Learned ${result.nodesAdded} new insight(s).`));
+    } else {
+      console.log(chalk.yellow("No patterns extracted. Try a more specific statement."));
+    }
   });
 
 program

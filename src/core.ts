@@ -7,6 +7,8 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { GraphStore } from "./graph/store.js";
 import { queryGraph, shortestPath } from "./graph/query.js";
 import { extractDirectory } from "./miners/ast-miner.js";
+import { mineGitHistory } from "./miners/git-miner.js";
+import { mineSessionHistory, learnFromSession } from "./miners/session-miner.js";
 import type { GraphStats } from "./graph/schema.js";
 
 const ENGRAM_DIR = ".engram";
@@ -41,16 +43,25 @@ export async function init(projectRoot: string): Promise<InitResult> {
 
   const { nodes, edges, fileCount, totalLines } = extractDirectory(root);
 
+  // Git history mining
+  const gitResult = mineGitHistory(root);
+
+  // Session history mining (CLAUDE.md, .cursorrules, etc.)
+  const sessionResult = mineSessionHistory(root);
+
+  const allNodes = [...nodes, ...gitResult.nodes, ...sessionResult.nodes];
+  const allEdges = [...edges, ...gitResult.edges, ...sessionResult.edges];
+
   const store = await getStore(root);
   store.clearAll();
-  store.bulkUpsert(nodes, edges);
+  store.bulkUpsert(allNodes, allEdges);
   store.setStat("last_mined", String(Date.now()));
   store.setStat("project_root", root);
 
   const timeMs = Date.now() - start;
   store.close();
 
-  return { nodes: nodes.length, edges: edges.length, fileCount, totalLines, timeMs };
+  return { nodes: allNodes.length, edges: allEdges.length, fileCount, totalLines, timeMs };
 }
 
 /**
@@ -111,6 +122,24 @@ export async function stats(projectRoot: string): Promise<GraphStats> {
   const s = store.getStats();
   store.close();
   return s;
+}
+
+/**
+ * Learn from a text snippet (decision, pattern, mistake).
+ */
+export async function learn(
+  projectRoot: string,
+  text: string,
+  sourceLabel = "manual"
+): Promise<{ nodesAdded: number }> {
+  const { nodes, edges } = learnFromSession(text, sourceLabel);
+  if (nodes.length === 0 && edges.length === 0) {
+    return { nodesAdded: 0 };
+  }
+  const store = await getStore(projectRoot);
+  store.bulkUpsert(nodes, edges);
+  store.close();
+  return { nodesAdded: nodes.length };
 }
 
 /**

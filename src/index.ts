@@ -3,7 +3,7 @@
  *
  * @packageDocumentation
  */
-export { init, query, path, godNodes, stats, benchmark } from "./core.js";
+export { init, query, path, godNodes, stats, benchmark, learn } from "./core.js";
 export { GraphStore } from "./graph/store.js";
 export { queryGraph, shortestPath } from "./graph/query.js";
 export { extractFile, extractDirectory, SUPPORTED_EXTENSIONS } from "./miners/ast-miner.js";
