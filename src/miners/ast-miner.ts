@@ -124,11 +124,12 @@ export function extractFile(
   filePath: string,
   rootDir: string
 ): { nodes: GraphNode[]; edges: GraphEdge[] } {
-  const content = readFileSync(filePath, "utf-8");
-  const lines = content.split("\n");
   const ext = extname(filePath).toLowerCase();
   const lang = EXT_TO_LANG[ext];
   if (!lang) return { nodes: [], edges: [] };
+
+  const content = readFileSync(filePath, "utf-8");
+  const lines = content.split("\n");
 
   const relPath = relative(rootDir, filePath);
   const stem = basename(filePath, ext);
