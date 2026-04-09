@@ -2,6 +2,8 @@
 import { Command } from "commander";
 import chalk from "chalk";
 import { init, query, path, godNodes, stats, benchmark, learn } from "./core.js";
+import { install as installHooks, uninstall as uninstallHooks, status as hooksStatus } from "./hooks.js";
+import { autogen } from "./autogen.js";
 
 const program = new Command();
 
@@ -151,6 +153,38 @@ program
       console.log(`  ${chalk.dim(`[${pq.reductionRelevant}x relevant / ${pq.reductionFull}x full]`)} ${pq.question}`);
     }
     console.log();
+  });
+
+// ── hooks ───────────────────────────────────────────────────────────────────
+const hooks = program.command("hooks").description("Manage git hooks");
+
+hooks
+  .command("install")
+  .description("Install post-commit and post-checkout hooks")
+  .argument("[path]", "Project directory", ".")
+  .action((p: string) => console.log(installHooks(p)));
+
+hooks
+  .command("uninstall")
+  .description("Remove engram git hooks")
+  .argument("[path]", "Project directory", ".")
+  .action((p: string) => console.log(uninstallHooks(p)));
+
+hooks
+  .command("status")
+  .description("Check if hooks are installed")
+  .argument("[path]", "Project directory", ".")
+  .action((p: string) => console.log(hooksStatus(p)));
+
+// ── autogen ─────────────────────────────────────────────────────────────────
+program
+  .command("gen")
+  .description("Generate CLAUDE.md / .cursorrules section from graph")
+  .option("-p, --project <path>", "Project directory", ".")
+  .option("-t, --target <type>", "Target file: claude, cursor, agents")
+  .action(async (opts: { project: string; target?: string }) => {
+    const result = await autogen(opts.project, opts.target as any);
+    console.log(chalk.green(`✅ Updated ${result.file} (${result.nodesIncluded} nodes)`));
   });
 
 program.parse();

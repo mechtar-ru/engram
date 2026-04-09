@@ -4,6 +4,8 @@
  * @packageDocumentation
  */
 export { init, query, path, godNodes, stats, benchmark, learn } from "./core.js";
+export { install as installHooks, uninstall as uninstallHooks } from "./hooks.js";
+export { autogen } from "./autogen.js";
 export { GraphStore } from "./graph/store.js";
 export { queryGraph, shortestPath } from "./graph/query.js";
 export { extractFile, extractDirectory, SUPPORTED_EXTENSIONS } from "./miners/ast-miner.js";
