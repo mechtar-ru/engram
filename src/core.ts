@@ -3,16 +3,20 @@
  * This is the main API surface that CLI and MCP server both use.
  */
 import { join, resolve } from "node:path";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { homedir } from "node:os";
 import { GraphStore } from "./graph/store.js";
 import { queryGraph, shortestPath } from "./graph/query.js";
 import { extractDirectory } from "./miners/ast-miner.js";
 import { mineGitHistory } from "./miners/git-miner.js";
 import { mineSessionHistory, learnFromSession } from "./miners/session-miner.js";
+import { mineSkills } from "./miners/skills-miner.js";
 import type { GraphStats } from "./graph/schema.js";
 
 const ENGRAM_DIR = ".engram";
 const DB_FILE = "graph.db";
+const LOCK_FILE = "init.lock";
+const DEFAULT_SKILLS_DIR = join(homedir(), ".claude", "skills");
 
 export function getDbPath(projectRoot: string): string {
   return join(projectRoot, ENGRAM_DIR, DB_FILE);
@@ -28,32 +32,100 @@ export interface InitResult {
   fileCount: number;
   totalLines: number;
   timeMs: number;
+  skillCount?: number;
 }
 
-export async function init(projectRoot: string): Promise<InitResult> {
+export interface InitOptions {
+  /**
+   * Index Claude Code skills from the given directory.
+   *   - `true` → use `~/.claude/skills/`
+   *   - `string` → use the given path
+   *   - `false` | `undefined` → skip (default)
+   */
+  withSkills?: boolean | string;
+}
+
+export async function init(
+  projectRoot: string,
+  options: InitOptions = {}
+): Promise<InitResult> {
   const root = resolve(projectRoot);
   const start = Date.now();
 
   mkdirSync(join(root, ENGRAM_DIR), { recursive: true });
 
-  const { nodes, edges, fileCount, totalLines } = extractDirectory(root);
-  const gitResult = mineGitHistory(root);
-  const sessionResult = mineSessionHistory(root);
-
-  const allNodes = [...nodes, ...gitResult.nodes, ...sessionResult.nodes];
-  const allEdges = [...edges, ...gitResult.edges, ...sessionResult.edges];
-
-  const store = await getStore(root);
+  // Atomic lockfile — prevents two concurrent init calls from silently
+  // corrupting the graph. `wx` flag = exclusive create, fails if file exists.
+  const lockPath = join(root, ENGRAM_DIR, LOCK_FILE);
   try {
-    store.clearAll();
-    store.bulkUpsert(allNodes, allEdges);
-    store.setStat("last_mined", String(Date.now()));
-    store.setStat("project_root", root);
-  } finally {
-    store.close();
+    writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error(
+        `engram: another init is running on ${root} (lock: ${lockPath}). ` +
+          `If no other process is active, delete the lock file manually.`
+      );
+    }
+    throw err;
   }
 
-  return { nodes: allNodes.length, edges: allEdges.length, fileCount, totalLines, timeMs: Date.now() - start };
+  try {
+    const { nodes, edges, fileCount, totalLines } = extractDirectory(root);
+    const gitResult = mineGitHistory(root);
+    const sessionResult = mineSessionHistory(root);
+
+    let skillCount = 0;
+    let skillNodes: typeof nodes = [];
+    let skillEdges: typeof edges = [];
+    if (options.withSkills) {
+      const skillsDir =
+        typeof options.withSkills === "string"
+          ? options.withSkills
+          : DEFAULT_SKILLS_DIR;
+      const skillsResult = mineSkills(skillsDir);
+      skillCount = skillsResult.skillCount;
+      skillNodes = skillsResult.nodes;
+      skillEdges = skillsResult.edges;
+    }
+
+    const allNodes = [
+      ...nodes,
+      ...gitResult.nodes,
+      ...sessionResult.nodes,
+      ...skillNodes,
+    ];
+    const allEdges = [
+      ...edges,
+      ...gitResult.edges,
+      ...sessionResult.edges,
+      ...skillEdges,
+    ];
+
+    const store = await getStore(root);
+    try {
+      store.clearAll();
+      store.bulkUpsert(allNodes, allEdges);
+      store.setStat("last_mined", String(Date.now()));
+      store.setStat("project_root", root);
+    } finally {
+      store.close();
+    }
+
+    return {
+      nodes: allNodes.length,
+      edges: allEdges.length,
+      fileCount,
+      totalLines,
+      timeMs: Date.now() - start,
+      skillCount,
+    };
+  } finally {
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      /* lock file may already be gone — not an error */
+    }
+  }
 }
 
 export async function query(
@@ -121,6 +193,49 @@ export async function learn(
     store.close();
   }
   return { nodesAdded: nodes.length };
+}
+
+export interface MistakeEntry {
+  id: string;
+  label: string;
+  confidence: string;
+  confidenceScore: number;
+  sourceFile: string;
+  lastVerified: number;
+}
+
+/**
+ * v0.2: list mistake nodes from the graph. Powers the `engram mistakes`
+ * CLI command and the `list_mistakes` MCP tool. Mistakes are sorted by
+ * most-recently-verified first.
+ */
+export async function mistakes(
+  projectRoot: string,
+  options: { limit?: number; sinceDays?: number } = {}
+): Promise<MistakeEntry[]> {
+  const store = await getStore(projectRoot);
+  try {
+    let items = store.getAllNodes().filter((n) => n.kind === "mistake");
+
+    if (options.sinceDays !== undefined) {
+      const cutoff = Date.now() - options.sinceDays * 24 * 60 * 60 * 1000;
+      items = items.filter((m) => m.lastVerified >= cutoff);
+    }
+
+    items.sort((a, b) => b.lastVerified - a.lastVerified);
+
+    const limit = options.limit ?? 20;
+    return items.slice(0, limit).map((m) => ({
+      id: m.id,
+      label: m.label,
+      confidence: m.confidence,
+      confidenceScore: m.confidenceScore,
+      sourceFile: m.sourceFile,
+      lastVerified: m.lastVerified,
+    }));
+  } finally {
+    store.close();
+  }
 }
 
 export async function benchmark(

@@ -1,9 +1,26 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { init, query, godNodes, stats } from "../src/core.js";
+import {
+  init,
+  query,
+  godNodes,
+  stats,
+  mistakes as listMistakes,
+} from "../src/core.js";
 import { extractFile, extractDirectory } from "../src/miners/ast-miner.js";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, symlinkSync } from "node:fs";
-import { join } from "node:path";
+import { GraphStore } from "../src/graph/store.js";
+import { generateSummary, VIEWS } from "../src/autogen.js";
+import { queryGraph } from "../src/graph/query.js";
+import type { GraphNode } from "../src/graph/schema.js";
+import {
+  mkdtempSync,
+  rmSync,
+  mkdirSync,
+  writeFileSync,
+  symlinkSync,
+} from "node:fs";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { spawn } from "node:child_process";
 
 describe("Stress — edge cases", () => {
   let tmpDir: string;
@@ -215,5 +232,395 @@ describe("Stress — scale", () => {
 
     expect(q.nodesFound).toBeGreaterThan(0);
     expect(qElapsed).toBeLessThan(1000);
+  });
+});
+
+// ─── Phase 4: v0.2 stress scenarios ─────────────────────────────────────────
+describe("Stress — v0.2 additions", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "engram-v02-stress-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("backwards compat: graph with only v0.1 NodeKinds opens with v0.2 code", async () => {
+    // Build a store containing ONLY v0.1 node kinds (no concept, no skill).
+    // v0.2 code must read it without errors — the schema is additive, not
+    // migratory. This pins the "no removals" contract for old graph.db files.
+    const v01Dir = join(tmpDir, ".engram");
+    mkdirSync(v01Dir);
+    const store = await GraphStore.open(join(v01Dir, "graph.db"));
+    const v01Nodes: GraphNode[] = [
+      {
+        id: "file_main",
+        label: "main.ts",
+        kind: "file",
+        sourceFile: "src/main.ts",
+        sourceLocation: null,
+        confidence: "EXTRACTED",
+        confidenceScore: 1.0,
+        lastVerified: Date.now(),
+        queryCount: 0,
+        metadata: {},
+      },
+      {
+        id: "fn_main",
+        label: "main()",
+        kind: "function",
+        sourceFile: "src/main.ts",
+        sourceLocation: "L10",
+        confidence: "EXTRACTED",
+        confidenceScore: 1.0,
+        lastVerified: Date.now(),
+        queryCount: 0,
+        metadata: {},
+      },
+      {
+        id: "dec_old",
+        label: "chose fastify over express",
+        kind: "decision",
+        sourceFile: "CLAUDE.md",
+        sourceLocation: null,
+        confidence: "INFERRED",
+        confidenceScore: 0.7,
+        lastVerified: Date.now(),
+        queryCount: 0,
+        metadata: {},
+      },
+    ];
+    store.bulkUpsert(v01Nodes, []);
+    store.close();
+
+    // Reopen with v0.2 code — generateSummary + queryGraph should work
+    const store2 = await GraphStore.open(join(v01Dir, "graph.db"));
+    try {
+      expect(() => generateSummary(store2, VIEWS.general)).not.toThrow();
+      const summary = generateSummary(store2, VIEWS.feature);
+      // main.ts file appears in the structure section
+      expect(summary).toContain("main.ts");
+      // Decision appears in the decisions section
+      expect(summary).toContain("chose fastify");
+      // queryGraph must not throw on a v0.1-style graph — behaviour may be
+      // empty or populated depending on text match; what matters is no crash
+      expect(() => queryGraph(store2, "fastify")).not.toThrow();
+      // No crash from missing concept nodes — god node exclusion still works
+      const gods = store2.getGodNodes(10);
+      expect(gods.every((g) => g.node.kind !== "concept")).toBe(true);
+    } finally {
+      store2.close();
+    }
+  });
+
+  it("generateSummary on 1000-node graph runs under 100ms for every view", async () => {
+    const store = await GraphStore.open(join(tmpDir, "graph.db"));
+    try {
+      // Seed 1000 code nodes with a realistic mix of kinds
+      const nodes: GraphNode[] = [];
+      for (let i = 0; i < 700; i++) {
+        nodes.push({
+          id: `fn${i}`,
+          label: `func${i}()`,
+          kind: "function",
+          sourceFile: `src/mod${Math.floor(i / 20)}.ts`,
+          sourceLocation: `L${i}`,
+          confidence: "EXTRACTED",
+          confidenceScore: 1.0,
+          lastVerified: Date.now(),
+          queryCount: 0,
+          metadata: {},
+        });
+      }
+      for (let i = 0; i < 150; i++) {
+        nodes.push({
+          id: `file${i}`,
+          label: `mod${i}.ts`,
+          kind: "file",
+          sourceFile: `src/mod${i}.ts`,
+          sourceLocation: null,
+          confidence: "EXTRACTED",
+          confidenceScore: 1.0,
+          lastVerified: Date.now(),
+          queryCount: 0,
+          metadata: {},
+        });
+      }
+      for (let i = 0; i < 100; i++) {
+        nodes.push({
+          id: `dec${i}`,
+          label: `decision ${i}`,
+          kind: "decision",
+          sourceFile: "CLAUDE.md",
+          sourceLocation: null,
+          confidence: "INFERRED",
+          confidenceScore: 0.7,
+          lastVerified: Date.now(),
+          queryCount: 0,
+          metadata: {},
+        });
+      }
+      for (let i = 0; i < 50; i++) {
+        nodes.push({
+          id: `mis${i}`,
+          label: `past mistake ${i}`,
+          kind: "mistake",
+          sourceFile: "CLAUDE.md",
+          sourceLocation: null,
+          confidence: "INFERRED",
+          confidenceScore: 0.6,
+          lastVerified: Date.now(),
+          queryCount: 0,
+          metadata: {},
+        });
+      }
+      store.bulkUpsert(nodes, []);
+
+      for (const view of Object.values(VIEWS)) {
+        const start = Date.now();
+        const out = generateSummary(store, view);
+        const elapsed = Date.now() - start;
+        expect(out).toContain("engram:start");
+        expect(elapsed).toBeLessThan(100);
+      }
+    } finally {
+      store.close();
+    }
+  });
+
+  it("100 mistakes in graph: query returns highest-scoring mistake first", async () => {
+    const store = await GraphStore.open(join(tmpDir, "graph.db"));
+    try {
+      const nodes: GraphNode[] = [];
+      for (let i = 0; i < 100; i++) {
+        nodes.push({
+          id: `mis${i}`,
+          label: `generic mistake ${i}`,
+          kind: "mistake",
+          sourceFile: "CLAUDE.md",
+          sourceLocation: null,
+          confidence: "INFERRED",
+          confidenceScore: 0.6,
+          lastVerified: Date.now(),
+          queryCount: 0,
+          metadata: {},
+        });
+      }
+      // One mistake with a specific unique term
+      nodes.push({
+        id: "mis_unique",
+        label: "specific flanglefrobitz race condition at startup",
+        kind: "mistake",
+        sourceFile: "CLAUDE.md",
+        sourceLocation: null,
+        confidence: "INFERRED",
+        confidenceScore: 0.6,
+        lastVerified: Date.now(),
+        queryCount: 0,
+        metadata: {},
+      });
+      store.bulkUpsert(nodes, []);
+
+      const result = queryGraph(store, "flanglefrobitz");
+      expect(result.text).toContain("⚠️");
+      expect(result.text).toContain("flanglefrobitz");
+      // Warning block appears before any NODE lines (or there are none)
+      const warnIdx = result.text.indexOf("⚠️");
+      const nodeIdx = result.text.indexOf("NODE ");
+      expect(warnIdx).toBeGreaterThan(-1);
+      if (nodeIdx > -1) {
+        expect(warnIdx).toBeLessThan(nodeIdx);
+      }
+    } finally {
+      store.close();
+    }
+  });
+
+  it("mistakes() API: 200-entry graph returns correct slice", async () => {
+    mkdirSync(join(tmpDir, "src"));
+    writeFileSync(join(tmpDir, "src", "a.ts"), "export function a() {}\n");
+    await init(tmpDir);
+
+    // Directly inject 200 mistake nodes
+    const store = await GraphStore.open(join(tmpDir, ".engram", "graph.db"));
+    try {
+      const now = Date.now();
+      const nodes: GraphNode[] = [];
+      for (let i = 0; i < 200; i++) {
+        nodes.push({
+          id: `mis_bulk_${i}`,
+          label: `mistake number ${i}`,
+          kind: "mistake",
+          sourceFile: "CLAUDE.md",
+          sourceLocation: null,
+          confidence: "INFERRED",
+          confidenceScore: 0.6,
+          lastVerified: now - i * 1000, // older = smaller lastVerified
+          queryCount: 0,
+          metadata: {},
+        });
+      }
+      store.bulkUpsert(nodes, []);
+    } finally {
+      store.close();
+    }
+
+    const top5 = await listMistakes(tmpDir, { limit: 5 });
+    expect(top5.length).toBe(5);
+    // Most recent should be first (mistake number 0 has latest lastVerified)
+    expect(top5[0].label).toContain("mistake number 0");
+  });
+
+  it("MCP stdio smoke: spawn engram-serve, verify list_mistakes returns valid JSON", async () => {
+    mkdirSync(join(tmpDir, "src"));
+    writeFileSync(join(tmpDir, "src", "a.ts"), "export function a() {}\n");
+    await init(tmpDir);
+
+    const servePath = resolve("./dist/serve.js");
+    const child = spawn("node", [servePath, tmpDir], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    const responses: string[] = [];
+    await new Promise<void>((resolveP, rejectP) => {
+      const timeout = setTimeout(() => {
+        child.kill();
+        rejectP(new Error("MCP server timeout"));
+      }, 5000);
+
+      child.stdout.on("data", (chunk: Buffer) => {
+        const lines = chunk.toString().split("\n").filter(Boolean);
+        responses.push(...lines);
+        if (responses.length >= 3) {
+          clearTimeout(timeout);
+          child.kill();
+          resolveP();
+        }
+      });
+
+      child.stdin.write(
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n'
+      );
+      child.stdin.write(
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_mistakes","arguments":{}}}\n'
+      );
+      // Force a parse error to test the -32700 path
+      child.stdin.write("not valid json\n");
+    });
+
+    expect(responses.length).toBeGreaterThanOrEqual(3);
+    // Parse all responses — every line must be valid JSON
+    const parsed = responses.map((r) => {
+      expect(() => JSON.parse(r)).not.toThrow();
+      return JSON.parse(r);
+    });
+
+    // Find the tools/list response by id (not by array index — order
+    // may vary depending on how data chunks are buffered)
+    const toolsResp = parsed.find((p) => p.id === 1);
+    expect(toolsResp).toBeDefined();
+    expect(toolsResp.result?.tools?.length).toBe(6);
+    expect(
+      toolsResp.result.tools.some(
+        (t: { name: string }) => t.name === "list_mistakes"
+      )
+    ).toBe(true);
+
+    // Find the parse error response (id: null, code: -32700)
+    const parseErr = parsed.find((p) => p.error?.code === -32700);
+    expect(parseErr).toBeDefined();
+    expect(parseErr.id).toBeNull();
+  }, 10000);
+
+  it("MCP stdio smoke: malicious numeric args get clamped, not crashed", async () => {
+    mkdirSync(join(tmpDir, "src"));
+    writeFileSync(join(tmpDir, "src", "a.ts"), "export function a() {}\n");
+    await init(tmpDir);
+
+    const servePath = resolve("./dist/serve.js");
+    const child = spawn("node", [servePath, tmpDir], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    const responses: string[] = [];
+    await new Promise<void>((resolveP, rejectP) => {
+      const timeout = setTimeout(() => {
+        child.kill();
+        rejectP(new Error("MCP server timeout"));
+      }, 5000);
+
+      child.stdout.on("data", (chunk: Buffer) => {
+        const lines = chunk.toString().split("\n").filter(Boolean);
+        responses.push(...lines);
+        if (responses.length >= 2) {
+          clearTimeout(timeout);
+          child.kill();
+          resolveP();
+        }
+      });
+
+      // Depth 999999 and token budget 9999999 should clamp, not DOS
+      child.stdin.write(
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query_graph","arguments":{"question":"a","depth":999999,"token_budget":9999999}}}\n'
+      );
+      // Negative limit should clamp to 1
+      child.stdin.write(
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_mistakes","arguments":{"limit":-100}}}\n'
+      );
+    });
+
+    expect(responses.length).toBeGreaterThanOrEqual(2);
+    for (const r of responses) {
+      const parsed = JSON.parse(r);
+      expect(parsed.jsonrpc).toBe("2.0");
+      expect(parsed.error).toBeUndefined(); // no server error despite malicious args
+    }
+  }, 10000);
+
+  it("2000 code files + 100 simulated skills completes init under 10s", async () => {
+    const skillsDir = join(tmpDir, "skills");
+    mkdirSync(skillsDir);
+    for (let i = 0; i < 100; i++) {
+      const sDir = join(skillsDir, `skill-${i}`);
+      mkdirSync(sDir);
+      writeFileSync(
+        join(sDir, "SKILL.md"),
+        `---\nname: skill-${i}\ndescription: "Use when testing stress ${i}."\n---\n\n# Skill ${i}\n`
+      );
+    }
+
+    const srcDir = join(tmpDir, "project", "src");
+    mkdirSync(srcDir, { recursive: true });
+    for (let i = 0; i < 2000; i++) {
+      writeFileSync(
+        join(srcDir, `mod${i}.ts`),
+        `export function mod${i}() { return ${i}; }\nexport class Mod${i} { doIt() { return ${i}; } }\n`
+      );
+    }
+
+    const start = Date.now();
+    const result = await init(join(tmpDir, "project"), {
+      withSkills: skillsDir,
+    });
+    const elapsed = Date.now() - start;
+
+    expect(result.fileCount).toBe(2000);
+    expect(result.skillCount).toBe(100);
+    expect(elapsed).toBeLessThan(10000);
+  }, 30000);
+
+  it("every view renders cleanly on an empty graph (no crashes)", async () => {
+    const store = await GraphStore.open(join(tmpDir, "graph.db"));
+    try {
+      for (const view of Object.values(VIEWS)) {
+        const out = generateSummary(store, view);
+        expect(out).toContain("engram:start");
+        expect(out).toContain("engram:end");
+      }
+    } finally {
+      store.close();
+    }
   });
 });

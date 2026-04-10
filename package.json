@@ -1,6 +1,6 @@
 {
   "name": "engramx",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "AI coding memory that learns from every session — persistent, structural, universal",
   "type": "module",
   "bin": {

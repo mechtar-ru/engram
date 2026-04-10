@@ -4,6 +4,17 @@
  */
 import type { GraphStore } from "./store.js";
 import type { GraphEdge, GraphNode } from "./schema.js";
+import { sliceGraphemeSafe, truncateGraphemeSafe } from "./render-utils.js";
+
+// v0.2: mistake priority boost. When a query matches a mistake node, it
+// gets a higher score so the regret buffer surfaces before normal results.
+// 2.5x is tuned by intuition — large enough to beat pure text-match score
+// parity, small enough that a stronger text match on a non-mistake still
+// wins. Verified in tests/mistake-memory.test.ts.
+const MISTAKE_SCORE_BOOST = 2.5;
+// Exported for use by the MCP server (serve.ts) so truncation is
+// consistent across the regret buffer block and the list_mistakes tool.
+export const MAX_MISTAKE_LABEL_CHARS = 500;
 
 const CHARS_PER_TOKEN = 4;
 
@@ -29,7 +40,12 @@ function scoreNodes(
       if (label.includes(t)) score += 2;
       if (file.includes(t)) score += 1;
     }
-    if (score > 0) scored.push({ score, node });
+    if (score > 0) {
+      // Priority boost for mistake nodes so the regret buffer surfaces
+      // relevant past failures before normal code results.
+      if (node.kind === "mistake") score *= MISTAKE_SCORE_BOOST;
+      scored.push({ score, node });
+    }
   }
 
   return scored.sort((a, b) => b.score - a.score);
@@ -188,13 +204,33 @@ function renderSubgraph(
   const charBudget = tokenBudget * CHARS_PER_TOKEN;
   const lines: string[] = [];
 
-  // Sort nodes by degree (most connected first)
+  // v0.2: regret buffer. If any mistakes are in the result set, emit them
+  // at the top of the output as a warning block and exclude them from the
+  // main NODE list (they're still in the scored results, just rendered
+  // separately with a distinctive marker).
+  const mistakes = nodes.filter((n) => n.kind === "mistake");
+  const nonMistakes = nodes.filter((n) => n.kind !== "mistake");
+
+  if (mistakes.length > 0) {
+    lines.push("⚠️ PAST MISTAKES (relevant to your query):");
+    for (const m of mistakes) {
+      const label = truncateGraphemeSafe(m.label, MAX_MISTAKE_LABEL_CHARS);
+      const confNote =
+        m.confidence === "EXTRACTED"
+          ? ""
+          : ` [confidence ${m.confidenceScore}]`;
+      lines.push(`  - ${label} (from ${m.sourceFile})${confNote}`);
+    }
+    lines.push("");
+  }
+
+  // Sort non-mistake nodes by degree (most connected first)
   const degreeMap = new Map<string, number>();
   for (const e of edges) {
     degreeMap.set(e.source, (degreeMap.get(e.source) ?? 0) + 1);
     degreeMap.set(e.target, (degreeMap.get(e.target) ?? 0) + 1);
   }
-  const sorted = [...nodes].sort(
+  const sorted = [...nonMistakes].sort(
     (a, b) => (degreeMap.get(b.id) ?? 0) - (degreeMap.get(a.id) ?? 0)
   );
 
@@ -204,6 +240,13 @@ function renderSubgraph(
     );
   }
 
+  // Edge lookup uses the full `nodes` array (not `nonMistakes`) because
+  // it's the complete set the BFS/DFS walk returned. Mistakes currently
+  // have ZERO outgoing edges by construction — session-miner.ts returns
+  // `edges: []` — so no EDGE line can reference a mistake label today.
+  // If a future miner ever attaches edges to mistake nodes, this loop
+  // would re-print the mistake label and break the "mistakes appear
+  // exactly once" test — rewrite to use `nonMistakes` if that happens.
   for (const e of edges) {
     const srcNode = nodes.find((n) => n.id === e.source);
     const tgtNode = nodes.find((n) => n.id === e.target);
@@ -220,8 +263,10 @@ function renderSubgraph(
 
   let output = lines.join("\n");
   if (output.length > charBudget) {
+    // Surrogate-safe slice — avoids leaving a lone high surrogate at the
+    // cut boundary, which would corrupt JSON serialization downstream.
     output =
-      output.slice(0, charBudget) +
+      sliceGraphemeSafe(output, charBudget) +
       `\n... (truncated to ~${tokenBudget} token budget)`;
   }
   return output;

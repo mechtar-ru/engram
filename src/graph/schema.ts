@@ -54,7 +54,11 @@ export type EdgeRelation =
   | "similar_to"
   | "rationale_for"
   | "method_of"
-  | "exports";
+  | "exports"
+  // v0.2: skills-miner uses this to link keyword concept nodes to the
+  // skill concept nodes they activate. Skills themselves use the existing
+  // `similar_to` relation for cross-references (Related Skills sections).
+  | "triggered_by";
 
 export interface GraphStats {
   readonly nodes: number;

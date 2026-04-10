@@ -15,7 +15,7 @@
   <a href="https://github.com/NickCirv/engram/actions"><img src="https://github.com/NickCirv/engram/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/node-%3E%3D20-brightgreen" alt="Node">
-  <img src="https://img.shields.io/badge/tests-132%20passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-63%20passing-brightgreen" alt="Tests">
   <img src="https://img.shields.io/badge/LLM%20cost-$0-green" alt="Zero LLM cost">
   <img src="https://img.shields.io/badge/native%20deps-zero-green" alt="Zero native deps">
 </p>
@@ -47,13 +47,11 @@ npx engram init
 
 Every AI coding session starts from zero. Claude Code re-reads your files. Cursor reindexes. Copilot has no memory. CLAUDE.md is a sticky note you write by hand.
 
-engram fixes this with five things no other tool combines:
+engram fixes this with three things no other tool combines:
 
 1. **Persistent knowledge graph** — survives across sessions, stored in `.engram/graph.db`
 2. **Learns from every session** — decisions, patterns, mistakes are extracted and remembered
 3. **Universal protocol** — MCP server + CLI + auto-generates CLAUDE.md, .cursorrules, AGENTS.md
-4. **Skill-aware** (v0.2) — indexes your `~/.claude/skills/` directory into the graph so queries return code *and* the skill to apply
-5. **Regret buffer** (v0.2) — surfaces past mistakes at the top of query results so your AI stops re-making the same wrong turns
 
 ## Install
 
@@ -74,7 +72,6 @@ Requires Node.js 20+. Zero native dependencies. No build tools needed.
 
 ```bash
 engram init [path]              # Scan codebase, build knowledge graph
-engram init --with-skills       # Also index ~/.claude/skills/ (v0.2)
 engram query "how does auth"    # Query the graph (BFS, token-budgeted)
 engram query "auth" --dfs       # DFS traversal (trace specific paths)
 engram gods                     # Show most connected entities
@@ -82,9 +79,7 @@ engram stats                    # Node/edge counts, token savings
 engram bench                    # Token reduction benchmark
 engram path "auth" "database"   # Shortest path between concepts
 engram learn "chose JWT..."     # Teach a decision or pattern
-engram mistakes                 # List known mistakes (v0.2)
 engram gen                      # Generate CLAUDE.md section from graph
-engram gen --task bug-fix       # Task-aware view (v0.2: general|bug-fix|feature|refactor)
 engram hooks install            # Auto-rebuild on git commit
 ```
 
@@ -128,13 +123,12 @@ Or if installed globally:
 }
 ```
 
-**MCP Tools** (6 total):
+**MCP Tools:**
 - `query_graph` — Search the knowledge graph with natural language
 - `god_nodes` — Core abstractions (most connected entities)
 - `graph_stats` — Node/edge counts, confidence breakdown
 - `shortest_path` — Trace connections between two concepts
 - `benchmark` — Token reduction measurement
-- `list_mistakes` — Known failure modes from past sessions (v0.2)
 
 ### Shell Wrapper (for Bash-based agents)
 
@@ -159,19 +153,6 @@ engram gen --target agents    # Write to AGENTS.md
 ```
 
 This writes a structured codebase summary — god nodes, file structure, key dependencies, decisions — so your AI assistant navigates by structure instead of grepping.
-
-### Task-Aware Views (v0.2)
-
-`engram gen --task <name>` emits different content based on what you're about to do. The four preset views are defined in `src/autogen.ts` as a data table — no branching logic — so you can add your own task modes without touching the renderer.
-
-```bash
-engram gen --task general     # default — balanced mix of sections
-engram gen --task bug-fix     # emphasizes hot files + past mistakes
-engram gen --task feature     # emphasizes architecture + decisions
-engram gen --task refactor    # emphasizes god nodes + dependency graph
-```
-
-Each view picks a different set of sections with different limits. For example, `bug-fix` omits `## Decisions` and `## Key dependencies` entirely (they'd just be noise when you're chasing a regression) and leads with `🔥 Hot files` and `⚠️ Past mistakes`.
 
 ## How engram Compares
 
@@ -265,26 +246,7 @@ src/
 
 TypeScript, JavaScript, Python, Go, Rust, Java, C, C++, Ruby, PHP.
 
-## Roadmap
-
-### v0.2 (current) — **shipped April 2026**
-- ✅ Skills miner — index `~/.claude/skills/` into the graph
-- ✅ Adaptive gen — task-aware views (`--task general|bug-fix|feature|refactor`)
-- ✅ Regret buffer — surface past mistakes at the top of query results
-- ✅ `list_mistakes` MCP tool
-- ✅ Atomic init lockfile
-- ✅ Marker-safe `writeToFile` + surrogate-safe truncation
-
-### v0.3
-- Tree-sitter WASM (20+ languages with full call-graph precision)
-- Cross-project graph (query patterns across *all* your projects)
-- Temporal graph (commit-snapshot deltas — "what changed in auth this week?")
-- Token enforcement PreToolUse hook for Claude Code
-
-### v0.4+
-- LLM-free semantic search (locality-sensitive hashing over n-grams)
-- Graph-as-IR experimental spike
-- Team memory sync (paid tier)
+Tree-sitter WASM integration (20+ languages with full call-graph precision) is planned for v0.2.
 
 ## Privacy
 

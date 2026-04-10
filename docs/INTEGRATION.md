@@ -21,7 +21,7 @@ Good for: manual use, shell scripts, CI pipelines.
 
 ### 2. MCP Server (for MCP-aware clients)
 
-engram ships a JSON-RPC stdio MCP server with 5 tools. Point Claude Code, Windsurf, or any MCP client at it:
+engram ships a JSON-RPC stdio MCP server with 6 tools. Point Claude Code, Windsurf, or any MCP client at it:
 
 ```json
 {
@@ -34,7 +34,7 @@ engram ships a JSON-RPC stdio MCP server with 5 tools. Point Claude Code, Windsu
 }
 ```
 
-Tools: `query_graph`, `god_nodes`, `graph_stats`, `shortest_path`, `benchmark`.
+Tools: `query_graph`, `god_nodes`, `graph_stats`, `shortest_path`, `benchmark`, `list_mistakes` (v0.2).
 
 One MCP server instance per project — the project path is baked into `args`. If you work across many projects, option 3 is cheaper.
 
@@ -89,6 +89,47 @@ engram gen --target agents     # AGENTS.md
 The generated section is delimited by `<!-- engram:start -->` / `<!-- engram:end -->` markers, so you can keep your own hand-written guidance above or below the auto-gen block and engram will only replace the delimited region on re-runs.
 
 This is the cheapest integration point: the structural summary loads into your AI's preload context on every session start, so even if the agent never calls engram directly, it benefits from the graph.
+
+### Task-Aware Views (v0.2)
+
+`engram gen --task <name>` writes a different slice of the graph depending on what you're about to do:
+
+```bash
+engram gen --task bug-fix     # leads with 🔥 hot files + ⚠️ past mistakes
+engram gen --task feature     # leads with god nodes + decisions + deps
+engram gen --task refactor    # leads with god nodes + dependency graph + patterns
+engram gen --task general     # balanced (default)
+```
+
+Under the hood this is a data table (`VIEWS` in `src/autogen.ts`) — each row specifies which sections to include and at what limits. Adding a custom view is adding a row, not editing code.
+
+## Indexing Claude Code Skills (v0.2)
+
+If you use Claude Code with its `~/.claude/skills/` directory, you can index those skills directly into your project's graph so queries return both the relevant code *and* the skill to apply:
+
+```bash
+engram init ~/myrepo --with-skills           # default: ~/.claude/skills/
+engram init ~/myrepo --with-skills ~/other-skills  # custom path
+```
+
+Skills become `concept` nodes with `metadata.subkind = "skill"`. Trigger phrases extracted from each `SKILL.md` description become separate `concept` keyword nodes, linked via the `triggered_by` edge relation. A query hitting a keyword node naturally walks the edge to the skill during BFS traversal — no new query code needed.
+
+**Opt-in, default OFF.** Users without a skills directory see zero behavior change.
+
+## Mistake Memory (v0.2)
+
+The session miner extracts mistakes from `CLAUDE.md` / `.cursorrules` / `.engram/sessions/` files (look for patterns like `bug: <description>` or `fix: <description>`). v0.2 promotes these to the TOP of query output in a `⚠️ PAST MISTAKES` warning block whenever a query matches.
+
+```bash
+engram mistakes                       # list all known mistakes
+engram mistakes --limit 10
+engram mistakes --since 30            # only mistakes verified in the last 30 days
+engram learn "bug: fs.readFile in event loop stalled prod"   # manually log one
+```
+
+Via MCP, Claude Code can call the `list_mistakes` tool to get the same data.
+
+**What the session miner does NOT match:** prose. The regex requires explicit colon-delimited markers (`bug: X`, `fix: X`, `pattern: X`). This keeps the false-positive rate at zero on prose documentation — we verified this against the engram README as a pinned regression test.
 
 ---
 
@@ -146,3 +187,6 @@ If `Last mined` is fresh (<24h) and node/edge counts look reasonable for the cod
 | `engram init` reports 0 files | The directory contains no supported source files. engram skips `node_modules`, `dist`, `.git`, and binary files. Verify with `find <path> -type f -name "*.ts"`. |
 | Graph stays stale | Install git hooks (`engram hooks install -p <path>`) or re-run `engram init` in CI. |
 | Cross-machine write conflicts | Only one machine should run `engram init` or have git hooks. Others should query only. |
+| `Another engram init is running (lock: ...)` | v0.2 lockfile guard. If no other process is actually running, `rm .engram/init.lock` to clear the stale lock. |
+| `cannot safely update CLAUDE.md: Found N start / M end marker(s)` | Your CLAUDE.md has unbalanced engram markers (usually from a manual edit). Fix them by hand and re-run. |
+| Skills-miner misses triggers in my `SKILL.md` | Check the description field. Triggers must be either (a) quoted strings (any Unicode quote), or (b) `Use when X` patterns. Sentence-boundary parsing survives periods inside identifiers like `Node.js`. |

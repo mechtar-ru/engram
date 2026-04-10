@@ -1,6 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { init, query, godNodes, stats, benchmark, learn } from "../src/core.js";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  mkdirSync,
+  writeFileSync,
+  existsSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -142,5 +148,93 @@ describe("Core — learn", () => {
   it("returns 0 for no extractable pattern", async () => {
     const result = await learn(tmpDir, "hello world");
     expect(result.nodesAdded).toBe(0);
+  });
+});
+
+describe("Core — init with skills (v0.2)", () => {
+  let tmpDir: string;
+  let skillsDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "engram-skills-init-"));
+    mkdirSync(join(tmpDir, "src"), { recursive: true });
+    writeFileSync(
+      join(tmpDir, "src", "app.ts"),
+      `export function main() { return "hi"; }\n`
+    );
+
+    // Mini skills directory
+    skillsDir = mkdtempSync(join(tmpdir(), "engram-skills-fixture-"));
+    mkdirSync(join(skillsDir, "test-skill-a"));
+    writeFileSync(
+      join(skillsDir, "test-skill-a", "SKILL.md"),
+      `---\nname: test-skill-a\ndescription: "Use when testing alpha. Triggers: 'alpha test'."\n---\n\n# Test Skill A\n`
+    );
+    mkdirSync(join(skillsDir, "test-skill-b"));
+    writeFileSync(
+      join(skillsDir, "test-skill-b", "SKILL.md"),
+      `---\nname: test-skill-b\ndescription: "Use when testing beta. Triggers: 'beta test'."\n---\n\n# Test Skill B\n`
+    );
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    rmSync(skillsDir, { recursive: true, force: true });
+  });
+
+  it("skips skills-miner by default (backwards compat)", async () => {
+    const result = await init(tmpDir);
+    expect(result.skillCount).toBe(0);
+  });
+
+  it("withSkills: <path> → mines the given directory", async () => {
+    const result = await init(tmpDir, { withSkills: skillsDir });
+    expect(result.skillCount).toBe(2);
+    expect(result.nodes).toBeGreaterThan(2); // code nodes + 2 skills + keyword nodes
+  });
+
+  it("withSkills: true → resolves to ~/.claude/skills (may be empty in CI)", async () => {
+    // This test only verifies the flag is honored and doesn't crash when the
+    // default path doesn't exist. We can't assert skillCount because CI may
+    // or may not have a ~/.claude/skills dir.
+    const result = await init(tmpDir, { withSkills: true });
+    expect(result.skillCount).toBeGreaterThanOrEqual(0);
+  });
+
+  it("skill nodes do not appear as god nodes (kind=concept excluded)", async () => {
+    await init(tmpDir, { withSkills: skillsDir });
+    const gods = await godNodes(tmpDir);
+    // God nodes should be code entities, not skill concepts
+    for (const g of gods) {
+      expect(g.kind).not.toBe("concept");
+    }
+  });
+});
+
+describe("Core — init lockfile guard (v0.2)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "engram-lock-"));
+    mkdirSync(join(tmpDir, "src"), { recursive: true });
+    writeFileSync(
+      join(tmpDir, "src", "app.ts"),
+      `export function main() {}\n`
+    );
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("throws when a lock file already exists", async () => {
+    mkdirSync(join(tmpDir, ".engram"));
+    writeFileSync(join(tmpDir, ".engram", "init.lock"), "99999");
+    await expect(init(tmpDir)).rejects.toThrow(/lock/i);
+  });
+
+  it("cleans up the lock file on success", async () => {
+    await init(tmpDir);
+    expect(existsSync(join(tmpDir, ".engram", "init.lock"))).toBe(false);
   });
 });

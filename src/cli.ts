@@ -1,7 +1,16 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import chalk from "chalk";
-import { init, query, path, godNodes, stats, benchmark, learn } from "./core.js";
+import {
+  init,
+  query,
+  path,
+  godNodes,
+  stats,
+  benchmark,
+  learn,
+  mistakes,
+} from "./core.js";
 import { install as installHooks, uninstall as uninstallHooks, status as hooksStatus } from "./hooks.js";
 import { autogen } from "./autogen.js";
 
@@ -10,15 +19,21 @@ const program = new Command();
 program
   .name("engram")
   .description("AI coding memory that learns from every session")
-  .version("0.1.0");
+  .version("0.2.0");
 
 program
   .command("init")
   .description("Scan codebase and build knowledge graph (zero LLM cost)")
   .argument("[path]", "Project directory", ".")
-  .action(async (projectPath: string) => {
+  .option(
+    "--with-skills [dir]",
+    "Also index Claude Code skills from ~/.claude/skills/ or a given path"
+  )
+  .action(async (projectPath: string, opts: { withSkills?: string | boolean }) => {
     console.log(chalk.dim("🔍 Scanning codebase..."));
-    const result = await init(projectPath);
+    const result = await init(projectPath, {
+      withSkills: opts.withSkills,
+    });
     console.log(
       chalk.green("🌳 AST extraction complete") +
         chalk.dim(` (${result.timeMs}ms, 0 tokens used)`)
@@ -26,6 +41,11 @@ program
     console.log(
       `   ${chalk.bold(String(result.nodes))} nodes, ${chalk.bold(String(result.edges))} edges from ${chalk.bold(String(result.fileCount))} files (${result.totalLines.toLocaleString()} lines)`
     );
+    if (result.skillCount && result.skillCount > 0) {
+      console.log(
+        chalk.cyan(`   ${chalk.bold(String(result.skillCount))} skills indexed`)
+      );
+    }
 
     const bench = await benchmark(projectPath);
     if (bench.naiveFullCorpus > 0 && bench.reductionVsRelevant > 1) {
@@ -139,6 +159,38 @@ program
   });
 
 program
+  .command("mistakes")
+  .description("List known mistakes extracted from past sessions")
+  .option("-p, --project <path>", "Project directory", ".")
+  .option("-l, --limit <n>", "Max entries to display", "20")
+  .option("--since <days>", "Only mistakes from the last N days")
+  .action(
+    async (opts: { project: string; limit: string; since?: string }) => {
+      const result = await mistakes(opts.project, {
+        limit: Number(opts.limit),
+        sinceDays: opts.since ? Number(opts.since) : undefined,
+      });
+      if (result.length === 0) {
+        console.log(chalk.yellow("No mistakes recorded."));
+        return;
+      }
+      console.log(
+        chalk.bold(`\n⚠️  ${result.length} mistake(s) recorded:\n`)
+      );
+      for (const m of result) {
+        const ago = Math.max(
+          1,
+          Math.round((Date.now() - m.lastVerified) / 86400000)
+        );
+        console.log(
+          `  ${chalk.dim(`[${m.sourceFile}, ${ago}d ago]`)} ${m.label}`
+        );
+      }
+      console.log();
+    }
+  );
+
+program
   .command("bench")
   .description("Run token reduction benchmark")
   .option("-p, --project <path>", "Project directory", ".")
@@ -182,9 +234,20 @@ program
   .description("Generate CLAUDE.md / .cursorrules section from graph")
   .option("-p, --project <path>", "Project directory", ".")
   .option("-t, --target <type>", "Target file: claude, cursor, agents")
-  .action(async (opts: { project: string; target?: string }) => {
-    const result = await autogen(opts.project, opts.target as any);
-    console.log(chalk.green(`✅ Updated ${result.file} (${result.nodesIncluded} nodes)`));
-  });
+  .option(
+    "--task <name>",
+    "Task-aware view: general (default), bug-fix, feature, refactor"
+  )
+  .action(
+    async (opts: { project: string; target?: string; task?: string }) => {
+      const target = opts.target as "claude" | "cursor" | "agents" | undefined;
+      const result = await autogen(opts.project, target, opts.task);
+      console.log(
+        chalk.green(
+          `✅ Updated ${result.file} (${result.nodesIncluded} nodes, view: ${result.view})`
+        )
+      );
+    }
+  );
 
 program.parse();

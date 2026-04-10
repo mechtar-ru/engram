@@ -185,11 +185,16 @@ export class GraphStore {
 
   getGodNodes(topN = 10): Array<{ node: GraphNode; degree: number }> {
     const results: Array<{ node: GraphNode; degree: number }> = [];
+    // Exclude structural plumbing (file/import/module) AND concept nodes.
+    // The `concept` kind is used by the skills-miner for both skills and
+    // keyword nodes — a keyword like "landing page" may have hundreds of
+    // triggered_by edges but isn't a "core abstraction" of the codebase.
+    // Users want real code entities + decisions/patterns/mistakes here.
     const stmt = this.db.prepare(
       `SELECT n.*, COUNT(*) as degree
        FROM nodes n
        JOIN edges e ON e.source = n.id OR e.target = n.id
-       WHERE n.kind NOT IN ('file', 'import', 'module')
+       WHERE n.kind NOT IN ('file', 'import', 'module', 'concept')
        GROUP BY n.id
        ORDER BY degree DESC
        LIMIT ?`
