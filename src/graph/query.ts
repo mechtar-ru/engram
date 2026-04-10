@@ -12,9 +12,30 @@ import { sliceGraphemeSafe, truncateGraphemeSafe } from "./render-utils.js";
 // parity, small enough that a stronger text match on a non-mistake still
 // wins. Verified in tests/mistake-memory.test.ts.
 const MISTAKE_SCORE_BOOST = 2.5;
+
+// v0.2.1: keyword concept downweight. The skills-miner creates hundreds
+// of `concept` nodes with `metadata.subkind === "keyword"` that serve as
+// routing intermediaries between a text-matched trigger phrase and its
+// parent skill. They should be seed-eligible when nothing else matches
+// (so skill discovery via keyword bridges still works), but must NOT
+// dominate code-query seeding. Without this downweight, a query like
+// "how does auth work" seeds BFS from ~30 keyword nodes and pulls in
+// the whole skill subgraph, diluting code navigation 5x. Verified in
+// tests/stress.test.ts (keyword regression test).
+const KEYWORD_SCORE_DOWNWEIGHT = 0.5;
+
 // Exported for use by the MCP server (serve.ts) so truncation is
 // consistent across the regret buffer block and the list_mistakes tool.
 export const MAX_MISTAKE_LABEL_CHARS = 500;
+
+// v0.2.1: a node is a "hidden keyword" if it's a concept with subkind
+// "keyword". Keywords are invisible at the render layer — they're
+// traversal intermediaries only, never user-visible output.
+function isHiddenKeyword(node: GraphNode): boolean {
+  if (node.kind !== "concept") return false;
+  const meta = node.metadata as Record<string, unknown> | undefined;
+  return meta?.subkind === "keyword";
+}
 
 const CHARS_PER_TOKEN = 4;
 
@@ -44,6 +65,11 @@ function scoreNodes(
       // Priority boost for mistake nodes so the regret buffer surfaces
       // relevant past failures before normal code results.
       if (node.kind === "mistake") score *= MISTAKE_SCORE_BOOST;
+      // Priority downweight for keyword concept nodes. Keeps them seed-
+      // eligible when no code/skill matches exist (so skill discovery
+      // via keyword bridges still works), but lets code nodes dominate
+      // seeding whenever they exist.
+      if (isHiddenKeyword(node)) score *= KEYWORD_SCORE_DOWNWEIGHT;
       scored.push({ score, node });
     }
   }
@@ -75,6 +101,22 @@ export function queryGraph(
   const visited = new Set<string>(startNodes.map((n) => n.id));
   const collectedEdges: GraphEdge[] = [];
 
+  // v0.2.1: traversal edge filter. `triggered_by` edges only connect
+  // keyword concept nodes to skill concept nodes. getNeighbors returns
+  // both directions, so when BFS is at a skill node and calls it, the
+  // 30+ inbound triggered_by edges get pulled into the frontier as
+  // keyword neighbors — the root cause of the v0.2.0 with-skills
+  // bloat. Suppress this by only walking `triggered_by` when the
+  // current frontier node is itself a keyword. Keywords remain
+  // reachable via direct text-match seeding; they just stop acting
+  // as "inbound attractors" for non-keyword traversal.
+  const shouldSkipEdgeFrom = (currentNodeId: string, edge: GraphEdge): boolean => {
+    if (edge.relation !== "triggered_by") return false;
+    const currentNode = store.getNode(currentNodeId);
+    if (!currentNode) return false;
+    return !isHiddenKeyword(currentNode);
+  };
+
   if (mode === "bfs") {
     let frontier = new Set(startNodes.map((n) => n.id));
     for (let d = 0; d < depth; d++) {
@@ -82,6 +124,7 @@ export function queryGraph(
       for (const nid of frontier) {
         const neighbors = store.getNeighbors(nid);
         for (const { node, edge } of neighbors) {
+          if (shouldSkipEdgeFrom(nid, edge)) continue;
           if (!visited.has(node.id)) {
             nextFrontier.add(node.id);
             collectedEdges.push(edge);
@@ -100,6 +143,7 @@ export function queryGraph(
       if (d > depth) continue;
       const neighbors = store.getNeighbors(id);
       for (const { node, edge } of neighbors) {
+        if (shouldSkipEdgeFrom(id, edge)) continue;
         if (!visited.has(node.id)) {
           visited.add(node.id);
           stack.push({ id: node.id, d: d + 1 });
@@ -209,7 +253,18 @@ function renderSubgraph(
   // main NODE list (they're still in the scored results, just rendered
   // separately with a distinctive marker).
   const mistakes = nodes.filter((n) => n.kind === "mistake");
-  const nonMistakes = nodes.filter((n) => n.kind !== "mistake");
+
+  // v0.2.1: Filter keyword concept nodes out of visible output. They're
+  // traversal intermediaries (text-matched entry points that route BFS
+  // to skill concepts via `triggered_by` edges), not user-facing content.
+  // Emitting them pollutes the result set 5x on projects with indexed
+  // skills. Skill concepts themselves and all other kinds remain visible.
+  const visible = nodes.filter(
+    (n) => n.kind !== "mistake" && !isHiddenKeyword(n)
+  );
+  const hiddenKeywordIds = new Set(
+    nodes.filter(isHiddenKeyword).map((n) => n.id)
+  );
 
   if (mistakes.length > 0) {
     lines.push("⚠️ PAST MISTAKES (relevant to your query):");
@@ -224,13 +279,13 @@ function renderSubgraph(
     lines.push("");
   }
 
-  // Sort non-mistake nodes by degree (most connected first)
+  // Sort visible nodes by degree (most connected first)
   const degreeMap = new Map<string, number>();
   for (const e of edges) {
     degreeMap.set(e.source, (degreeMap.get(e.source) ?? 0) + 1);
     degreeMap.set(e.target, (degreeMap.get(e.target) ?? 0) + 1);
   }
-  const sorted = [...nonMistakes].sort(
+  const sorted = [...visible].sort(
     (a, b) => (degreeMap.get(b.id) ?? 0) - (degreeMap.get(a.id) ?? 0)
   );
 
@@ -240,14 +295,42 @@ function renderSubgraph(
     );
   }
 
-  // Edge lookup uses the full `nodes` array (not `nonMistakes`) because
-  // it's the complete set the BFS/DFS walk returned. Mistakes currently
-  // have ZERO outgoing edges by construction — session-miner.ts returns
-  // `edges: []` — so no EDGE line can reference a mistake label today.
-  // If a future miner ever attaches edges to mistake nodes, this loop
-  // would re-print the mistake label and break the "mistakes appear
-  // exactly once" test — rewrite to use `nonMistakes` if that happens.
+  // Build a set of skill concept IDs for the skill↔skill similar_to
+  // edge filter below. Skills live as `concept` nodes with metadata
+  // subkind === "skill".
+  const skillConceptIds = new Set(
+    nodes
+      .filter(
+        (n) =>
+          n.kind === "concept" &&
+          (n.metadata as Record<string, unknown> | undefined)?.subkind ===
+            "skill"
+      )
+      .map((n) => n.id)
+  );
+
+  // Edge rendering: look up endpoint nodes in the full `nodes` array.
+  // Mistakes have zero outgoing edges by construction (session-miner.ts
+  // returns `edges: []`), so no EDGE line would ever reference a mistake.
+  // v0.2.1: skip (a) any edge whose source OR target is a hidden keyword
+  // concept — rendering `EDGE code_fn --triggered_by--> keyword_foo`
+  // would expose the keyword label even though the node itself is
+  // filtered from the NODE list; and (b) `similar_to` edges where BOTH
+  // endpoints are skill concepts — these are skill cross-references that
+  // add noise to code-focused queries without providing actionable
+  // structural information. A user asking about skill networks can still
+  // see the skill nodes themselves in the NODE list.
   for (const e of edges) {
+    if (hiddenKeywordIds.has(e.source) || hiddenKeywordIds.has(e.target)) {
+      continue;
+    }
+    if (
+      e.relation === "similar_to" &&
+      skillConceptIds.has(e.source) &&
+      skillConceptIds.has(e.target)
+    ) {
+      continue;
+    }
     const srcNode = nodes.find((n) => n.id === e.source);
     const tgtNode = nodes.find((n) => n.id === e.target);
     if (srcNode && tgtNode) {

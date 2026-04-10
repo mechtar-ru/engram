@@ -19,7 +19,7 @@ const program = new Command();
 program
   .name("engram")
   .description("AI coding memory that learns from every session")
-  .version("0.2.0");
+  .version("0.2.1");
 
 program
   .command("init")

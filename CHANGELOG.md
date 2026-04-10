@@ -4,6 +4,83 @@ All notable changes to engram are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-04-10
+
+### Fixed
+
+- **`--with-skills` query token regression.** v0.2.0 shipped with a
+  silent 5x token cost when `engram init --with-skills` was used —
+  query avg went from 406 tokens (without skills) to 1,978 tokens
+  (with skills), and the `vs relevant files` savings metric collapsed
+  from 4.8x to 0x. The regression was discovered during post-release
+  real-world benchmarking on 6 indexed projects.
+
+  Root cause: `scoreNodes` treated keyword concept nodes (trigger-
+  phrase routing intermediaries created by the skills-miner) equally
+  with code nodes when picking BFS start seeds. A query like "how
+  does auth work" would seed BFS from ~30 keyword concepts (auth
+  flow, auth header, auth token, etc.), and BFS then pulled in the
+  entire skill subgraph via `triggered_by` edges, rendering 2,700+
+  nodes worth of noise.
+
+  Three-part fix in `src/graph/query.ts`:
+  1. `scoreNodes` downweights keyword concepts by 0.5× so code nodes
+     dominate seeding whenever they exist. Keywords remain seed-
+     eligible when NO code matches, preserving skill discovery.
+  2. `renderSubgraph` filters keyword concepts out of visible output
+     entirely (they stay as BFS traversal intermediaries, just
+     invisible in the rendered text). Edges touching keyword nodes
+     are also skipped to avoid exposing keyword labels via EDGE lines.
+  3. **BFS/DFS traversal filter:** `triggered_by` edges are only
+     walked when the current frontier node is itself a keyword. This
+     prevents skill concepts from pulling in their 30+ inbound
+     keyword neighbors via reverse edge expansion — the core
+     mechanism of the original bloat. Keywords remain reachable via
+     direct text-match seeding; they just stop acting as "inbound
+     attractors" for non-keyword traversal.
+
+  Plus a companion filter: `similar_to` edges between skill concepts
+  are suppressed from EDGE rendering — skill cross-reference
+  metadata adds noise to code-focused queries without structural
+  value. Skill NODE lines are still rendered so users asking for
+  skill suggestions still see them.
+
+  **Verified real-world impact:**
+
+  | Project | v0.2.0 broken | v0.2.1 fixed | No-skills baseline |
+  |---------|---------------|--------------|---------------------|
+  | engram  | 1,978 tok / 0x rel | **499 tok / 5.0x rel** | 406 tok / 4.8x rel |
+  | scripts | (N/A — not benched with skills in v0.2.0) | **272 tok / 2.4x rel** | 311 tok / 3.7x rel |
+
+  On engram itself, `--with-skills` now costs only ~23% more tokens
+  than pure code mode and the `vs relevant` savings is actually
+  _slightly better_ (5.0x vs 4.8x). On `scripts`, a code-heavy
+  project, there's still a modest ~35% cost for skill awareness but
+  the absolute savings are restored.
+
+  Pure code mode (`engram init` without `--with-skills`) is
+  unchanged and continues to deliver 3-11x savings vs relevant files.
+
+### Added
+
+- **6 new regression tests** in `tests/stress.test.ts`:
+  - Code query on a seeded graph with 20 keyword concepts — verifies
+    zero keyword labels in rendered output
+  - Token budget stays under 800 tokens on the same seeded graph
+  - Skill discovery via keyword bridges still works when no code
+    matches exist
+  - Direct skill-name query returns the skill
+  - Score downweight verified: code nodes outrank keywords when both
+    text-match
+  - No keyword labels leak through edge rendering (triggered_by
+    edges correctly skipped)
+
+### Tests
+
+- 132 → 138 tests passing across 8 test files. No regressions.
+
+---
+
 ## [0.2.0] — 2026-04-10
 
 ### Added

@@ -628,3 +628,236 @@ describe("Stress — v0.2 additions", () => {
     }
   });
 });
+
+// ─── v0.2.1: keyword concept scoring + render regression ────────────────────
+// Pin the fix for the `--with-skills` regression surfaced immediately after
+// v0.2.0 shipped. Without this, queries on projects with indexed skills
+// returned ~5x more tokens than without skills, because keyword concept
+// nodes (trigger-phrase bridges) were competing with code nodes for BFS
+// seeding and then getting emitted in the rendered output.
+//
+// The fix is two-part:
+//   1. scoreNodes downweights keyword concepts by 0.5× so code nodes
+//      dominate seeding whenever they exist
+//   2. renderSubgraph filters keyword concepts out of the visible output
+//      (they remain as BFS traversal intermediaries, just invisible)
+//
+// Both behaviors must hold: skill discovery via keyword bridges must
+// still work when there's no code match at all.
+describe("v0.2.1 — keyword concept scoring + render", () => {
+  let dir: string;
+  let store: GraphStore;
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), "engram-v021-"));
+    store = await GraphStore.open(join(dir, "graph.db"));
+
+    // Seed a mixed graph:
+    //   - 3 code functions with "auth" in their labels/files
+    //   - 1 skill concept named "authentication-patterns"
+    //   - 20 keyword concepts, 5 of which contain "auth"
+    //   - triggered_by edges from each keyword → skill
+    const nodes: GraphNode[] = [];
+    const edges: GraphEdge[] = [];
+
+    // Code functions (should dominate "auth" query seeding).
+    // Wire them with realistic `calls` edges so BFS from one code seed
+    // reaches the others — mirrors a real codebase where handleAuth
+    // calls validateToken which calls refreshSession.
+    nodes.push(
+      {
+        id: "fn_handleAuth",
+        label: "handleAuth()",
+        kind: "function",
+        sourceFile: "src/auth.ts",
+        sourceLocation: "L10",
+        confidence: "EXTRACTED",
+        confidenceScore: 1.0,
+        lastVerified: Date.now(),
+        queryCount: 0,
+        metadata: {},
+      },
+      {
+        id: "fn_validateToken",
+        label: "validateToken()",
+        kind: "function",
+        sourceFile: "src/auth.ts",
+        sourceLocation: "L25",
+        confidence: "EXTRACTED",
+        confidenceScore: 1.0,
+        lastVerified: Date.now(),
+        queryCount: 0,
+        metadata: {},
+      },
+      {
+        id: "fn_refreshSession",
+        label: "refreshSession()",
+        kind: "function",
+        sourceFile: "src/auth.ts",
+        sourceLocation: "L42",
+        confidence: "EXTRACTED",
+        confidenceScore: 1.0,
+        lastVerified: Date.now(),
+        queryCount: 0,
+        metadata: {},
+      }
+    );
+    const now = Date.now();
+    edges.push(
+      {
+        source: "fn_handleAuth",
+        target: "fn_validateToken",
+        relation: "calls",
+        confidence: "EXTRACTED",
+        confidenceScore: 1.0,
+        sourceFile: "src/auth.ts",
+        sourceLocation: "L12",
+        lastVerified: now,
+        metadata: {},
+      },
+      {
+        source: "fn_validateToken",
+        target: "fn_refreshSession",
+        relation: "calls",
+        confidence: "EXTRACTED",
+        confidenceScore: 1.0,
+        sourceFile: "src/auth.ts",
+        sourceLocation: "L28",
+        lastVerified: now,
+        metadata: {},
+      }
+    );
+
+    // A skill concept with "authentication" in its label
+    const skillId = "skill_authentication_patterns";
+    nodes.push({
+      id: skillId,
+      label: "authentication-patterns",
+      kind: "concept",
+      sourceFile: "authentication-patterns/SKILL.md",
+      sourceLocation: null,
+      confidence: "EXTRACTED",
+      confidenceScore: 1.0,
+      lastVerified: Date.now(),
+      queryCount: 0,
+      metadata: {
+        miner: "skills",
+        subkind: "skill",
+        description: "Use when implementing authentication in a backend.",
+      },
+    });
+
+    // 20 keyword concepts (5 contain "auth", 15 don't)
+    const authKeywords = [
+      "auth flow",
+      "auth header",
+      "auth token",
+      "auth session",
+      "auth middleware",
+    ];
+    const otherKeywords = Array.from(
+      { length: 15 },
+      (_, i) => `generic keyword ${i}`
+    );
+    for (const kw of [...authKeywords, ...otherKeywords]) {
+      const kwId = `keyword_${kw.replace(/\s+/g, "_")}`;
+      nodes.push({
+        id: kwId,
+        label: kw,
+        kind: "concept",
+        sourceFile: "authentication-patterns/SKILL.md",
+        sourceLocation: null,
+        confidence: "EXTRACTED",
+        confidenceScore: 1.0,
+        lastVerified: Date.now(),
+        queryCount: 0,
+        metadata: { miner: "skills", subkind: "keyword" },
+      });
+      edges.push({
+        source: kwId,
+        target: skillId,
+        relation: "triggered_by",
+        confidence: "EXTRACTED",
+        confidenceScore: 1.0,
+        sourceFile: "authentication-patterns/SKILL.md",
+        sourceLocation: null,
+        lastVerified: Date.now(),
+        metadata: { miner: "skills" },
+      });
+    }
+
+    store.bulkUpsert(nodes, edges);
+  });
+
+  afterEach(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("code query: visible output contains code, zero keyword concepts", () => {
+    const result = queryGraph(store, "how does auth work");
+    // Code nodes must be in the result
+    expect(result.text).toContain("handleAuth");
+    // ZERO keyword labels in the rendered output (even though BFS may
+    // have traversed them)
+    expect(result.text).not.toContain("auth flow");
+    expect(result.text).not.toContain("auth header");
+    expect(result.text).not.toContain("auth token");
+    expect(result.text).not.toContain("generic keyword");
+    // No triggered_by EDGE lines (they'd expose keyword labels)
+    expect(result.text).not.toContain("triggered_by");
+  });
+
+  it("code query: token budget stays tight even with keyword nodes in graph", () => {
+    const result = queryGraph(store, "how does auth work");
+    // Without the fix this would balloon to ~2000+ tokens. With the fix
+    // it stays under ~600 (code nodes + maybe the skill concept).
+    expect(result.estimatedTokens).toBeLessThan(800);
+  });
+
+  it("skill discovery still works when no code matches exist", () => {
+    // Query has no code matches — only keyword matches. The downweight
+    // means keywords score lower, but they're still seed-eligible when
+    // nothing else scores at all. BFS then walks to the skill.
+    const result = queryGraph(store, "authentication patterns for backend");
+    // The skill label should appear in the output
+    expect(result.text).toContain("authentication-patterns");
+    // Keywords themselves stay hidden
+    expect(result.text).not.toContain("auth flow");
+  });
+
+  it("direct skill name query returns the skill", () => {
+    const result = queryGraph(store, "authentication-patterns");
+    expect(result.text).toContain("authentication-patterns");
+  });
+
+  it("scoreNode downweight: code nodes outrank keywords when both match", () => {
+    // Internal sanity check. A code node matching "auth" with label+file
+    // scores 2 + 1 = 3. A keyword matching "auth" in label scores 2,
+    // downweighted to 1.0. Code should dominate top-3 seeds.
+    const result = queryGraph(store, "auth");
+    // The top results should be the 3 auth code functions, not 3 auth
+    // keyword nodes. Verify at least 2 of the 3 code functions appear
+    // in the visible output.
+    const codeMatches = [
+      "handleAuth",
+      "validateToken",
+      "refreshSession",
+    ].filter((fn) => result.text.includes(fn));
+    expect(codeMatches.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("no keyword concept nodes leak through edge rendering", () => {
+    // Even if BFS pulls keyword nodes in as neighbors, the edge-
+    // rendering phase must skip edges whose source OR target is a
+    // hidden keyword. Nothing containing `triggered_by` should appear
+    // in the rendered output.
+    const result = queryGraph(store, "auth");
+    // The string "triggered_by" would only appear if an EDGE line
+    // referencing a keyword was emitted — we filter those.
+    expect(result.text).not.toContain("triggered_by");
+    // And no keyword label text
+    expect(result.text).not.toMatch(/\bauth flow\b/);
+    expect(result.text).not.toMatch(/\bgeneric keyword\b/);
+  });
+});

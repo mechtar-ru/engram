@@ -221,7 +221,7 @@ async function handleRequest(req: McpRequest): Promise<McpResponse> {
         result: {
           protocolVersion: "2024-11-05",
           capabilities: { tools: {} },
-          serverInfo: { name: "engram", version: "0.2.0" },
+          serverInfo: { name: "engram", version: "0.2.1" },
         },
       };
 
