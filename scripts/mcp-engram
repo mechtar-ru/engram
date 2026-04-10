@@ -1,0 +1,84 @@
+#!/bin/bash
+# mcp-engram — lightweight Bash wrapper for the engram CLI
+#
+# Purpose: give shell-based AI agents (Claude Code, aider, custom pipelines)
+# a cheap T1-cost command to query the engram knowledge graph without
+# starting a JSON-RPC MCP server. Use this when you want one command that
+# works across all projects via `-p <path>`.
+#
+# Install:
+#   1. npm install -g engramx
+#   2. cp scripts/mcp-engram ~/bin/mcp-engram
+#   3. chmod +x ~/bin/mcp-engram
+#   4. Make sure ~/bin is on your PATH
+#
+# Portable: prefers the globally-installed `engram` binary, falls back to a
+# local dist at $HOME/engram/dist/cli.js if you're hacking on the source.
+#
+# Usage:
+#   mcp-engram query "how does auth work" -p ~/myrepo
+#   mcp-engram gods -p ~/myrepo
+#   mcp-engram stats -p ~/myrepo
+#   mcp-engram path "auth" "database" -p ~/myrepo
+#   mcp-engram bench -p ~/myrepo
+#   mcp-engram init ~/myrepo
+#   mcp-engram learn "chose JWT for horizontal scaling" -p ~/myrepo
+#   mcp-engram gen -p ~/myrepo
+#   mcp-engram hooks install -p ~/myrepo
+#   mcp-engram --which    # show resolved runner
+#   mcp-engram --list     # list commands
+
+set -e
+
+# Resolve engram runner: prefer global bin, fall back to local dist
+if command -v engram >/dev/null 2>&1; then
+  ENGRAM_RUN=(engram)
+elif [ -e "$HOME/engram/dist/cli.js" ]; then
+  ENGRAM_RUN=(node "$HOME/engram/dist/cli.js")
+else
+  echo "Error: engram not found." >&2
+  echo "Install with: npm install -g engramx" >&2
+  exit 1
+fi
+
+case "$1" in
+  query|gods|stats|init|path|learn|gen|hooks)
+    cmd="$1"
+    shift
+    "${ENGRAM_RUN[@]}" "$cmd" "$@"
+    ;;
+  benchmark|bench)
+    shift
+    "${ENGRAM_RUN[@]}" bench "$@"
+    ;;
+  --list)
+    echo "Available commands: query, gods, stats, benchmark, init, path, learn, gen, hooks"
+    ;;
+  --which)
+    echo "${ENGRAM_RUN[@]}"
+    ;;
+  ""|--help|-h)
+    cat <<'EOF'
+Usage: mcp-engram <command> [args]
+
+Commands:
+  query <question> -p <path>   Traverse graph for relevant context
+  gods -p <path>               List most-connected entities
+  stats -p <path>              Graph statistics
+  path <from> <to> -p <path>   Shortest path between two concepts
+  benchmark -p <path>          Token savings vs naive baselines
+  init <path>                  Scan project and build graph
+  learn <text> -p <path>       Store decision/pattern/mistake
+  gen -p <path>                Auto-generate CLAUDE.md section
+  hooks install -p <path>      Install git hooks for auto-rebuild
+
+  --list                       List commands
+  --which                      Show resolved engram runner
+EOF
+    ;;
+  *)
+    echo "Unknown command: $1" >&2
+    echo "Use --help for usage" >&2
+    exit 1
+    ;;
+esac

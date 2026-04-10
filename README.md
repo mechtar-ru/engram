@@ -7,6 +7,7 @@
   <a href="#usage"><strong>Usage</strong></a> ·
   <a href="#mcp-server"><strong>MCP Server</strong></a> ·
   <a href="#how-it-works"><strong>How It Works</strong></a> ·
+  <a href="docs/INTEGRATION.md"><strong>Integration Guide</strong></a> ·
   <a href="#contributing"><strong>Contributing</strong></a>
 </p>
 
@@ -128,6 +129,17 @@ Or if installed globally:
 - `graph_stats` — Node/edge counts, confidence breakdown
 - `shortest_path` — Trace connections between two concepts
 - `benchmark` — Token reduction measurement
+
+### Shell Wrapper (for Bash-based agents)
+
+If your agent stack runs shell commands instead of JSON-RPC MCP, use the reference wrapper at [`scripts/mcp-engram`](scripts/mcp-engram). One command handles all projects via `-p <path>` — no per-project MCP server needed.
+
+```bash
+cp scripts/mcp-engram ~/bin/mcp-engram && chmod +x ~/bin/mcp-engram
+mcp-engram query "how does auth work" -p ~/myrepo
+```
+
+See [`docs/INTEGRATION.md`](docs/INTEGRATION.md) for multi-machine setups, rule-file integration, and gotchas.
 
 ## Auto-Generated AI Instructions
 
