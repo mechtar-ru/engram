@@ -504,6 +504,42 @@ function getPatterns(lang: string): LangPatterns {
   }
 }
 
+const MAX_DEPTH = 100;
+
+const DEFAULT_EXCLUDED_DIRS = new Set([
+  "node_modules",
+  "dist",
+  "build",
+  "__pycache__",
+  "vendor",
+  ".engram",
+  "target",
+  ".venv",
+  ".next",
+  ".nuxt",
+  ".output",
+  "coverage",
+  ".turbo",
+  ".cache",
+]);
+
+function loadEngramIgnore(rootDir: string): Set<string> {
+  const ignoreFile = join(rootDir, ".engramignore");
+  const excluded = new Set(DEFAULT_EXCLUDED_DIRS);
+  try {
+    const content = readFileSync(ignoreFile, "utf-8");
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed && !trimmed.startsWith("#")) {
+        excluded.add(trimmed);
+      }
+    }
+  } catch {
+    // no .engramignore file
+  }
+  return excluded;
+}
+
 /**
  * Scan a directory recursively and extract all supported code files.
  */
@@ -518,35 +554,38 @@ export function extractDirectory(
   let totalLines = 0;
 
   const visitedDirs = new Set<string>();
+  const excludedDirs = loadEngramIgnore(root);
 
-  function walk(dir: string): void {
-    // Symlink loop protection
+  function walk(dir: string, depth: number): void {
+    if (depth > MAX_DEPTH) return;
+
     let realDir: string;
     try {
       realDir = realpathSync(dir);
     } catch {
-      return; // broken symlink
+      return;
     }
     if (visitedDirs.has(realDir)) return;
     visitedDirs.add(realDir);
 
-    const entries = readdirSync(dir, { withFileTypes: true });
+    let entries: ReturnType<typeof readdirSync>;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
     for (const entry of entries) {
       const fullPath = join(dir, entry.name);
 
       if (entry.isDirectory()) {
         if (
           entry.name.startsWith(".") ||
-          entry.name === "node_modules" ||
-          entry.name === "dist" ||
-          entry.name === "build" ||
-          entry.name === "__pycache__" ||
-          entry.name === "vendor" ||
-          entry.name === ".engram"
+          excludedDirs.has(entry.name)
         ) {
           continue;
         }
-        walk(fullPath);
+        walk(fullPath, depth + 1);
         continue;
       }
 
@@ -568,6 +607,6 @@ export function extractDirectory(
     }
   }
 
-  walk(dirPath);
+  walk(dirPath, 0);
   return { nodes: allNodes, edges: allEdges, fileCount, totalLines };
 }
