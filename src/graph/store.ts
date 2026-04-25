@@ -5,6 +5,7 @@
 import initSqlJs, { type Database as SqlJsDatabase } from "sql.js";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
+import { runMigrations } from "../db/migrate.js";
 import type {
   Confidence,
   EdgeRelation,
@@ -95,6 +96,7 @@ export class GraphStore {
     for (const sql of indexes) {
       try { this.db.run(sql); } catch { /* already exists */ }
     }
+    runMigrations(this.db, this.dbPath);
   }
 
   save(): void {
@@ -104,8 +106,8 @@ export class GraphStore {
 
   upsertNode(node: GraphNode): void {
     this.db.run(
-      `INSERT OR REPLACE INTO nodes (id, label, kind, source_file, source_location, confidence, confidence_score, last_verified, query_count, metadata)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO nodes (id, label, kind, source_file, source_location, confidence, confidence_score, last_verified, query_count, metadata, valid_until, invalidated_by_commit)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         node.id,
         node.label,
@@ -117,6 +119,8 @@ export class GraphStore {
         node.lastVerified,
         node.queryCount,
         JSON.stringify(node.metadata),
+        node.validUntil ?? null,
+        node.invalidatedByCommit ?? null,
       ]
     );
   }
@@ -154,6 +158,20 @@ export class GraphStore {
       this.db.run("ROLLBACK");
       throw e;
     }
+  }
+
+  countBySourceFile(sourceFile: string): number {
+    const stmt = this.db.prepare(
+      "SELECT COUNT(*) AS n FROM nodes WHERE source_file = ?"
+    );
+    stmt.bind([sourceFile]);
+    let count = 0;
+    if (stmt.step()) {
+      const row = stmt.getAsObject() as { n: number };
+      count = Number(row.n) || 0;
+    }
+    stmt.free();
+    return count;
   }
 
   bulkUpsert(nodes: GraphNode[], edges: GraphEdge[]): void {
@@ -367,6 +385,17 @@ export class GraphStore {
     );
   }
 
+  /** Remove all nodes and edges originating from a specific source file. */
+  removeNodesForFile(sourceFile: string): void {
+    // Delete edges that reference nodes from this file
+    this.db.run(
+      `DELETE FROM edges WHERE source IN (SELECT id FROM nodes WHERE source_file = ?)
+       OR target IN (SELECT id FROM nodes WHERE source_file = ?)`,
+      [sourceFile, sourceFile]
+    );
+    this.db.run("DELETE FROM nodes WHERE source_file = ?", [sourceFile]);
+  }
+
   clearAll(): void {
     this.db.run("DELETE FROM nodes");
     this.db.run("DELETE FROM edges");
@@ -523,6 +552,25 @@ export class GraphStore {
     };
   }
 
+  // ─── Low-level DB access (for cache module) ──────────────────
+
+  /** Run raw SQL (DDL, DML). For cache table creation and updates. */
+  runSql(sql: string, params?: unknown[]): void {
+    if (params && params.length > 0) {
+      const stmt = this.db.prepare(sql);
+      stmt.bind(params as (string | number | null)[]);
+      stmt.step();
+      stmt.free();
+    } else {
+      this.db.run(sql);
+    }
+  }
+
+  /** Prepare a statement for row-by-row iteration. Caller must free(). */
+  prepare(sql: string): ReturnType<SqlJsDatabase["prepare"]> {
+    return this.db.prepare(sql);
+  }
+
   // ─── Lifecycle ────────────────────────────────────────────────
 
   close(): void {
@@ -531,6 +579,8 @@ export class GraphStore {
   }
 
   private rowToNode(row: Record<string, unknown>): GraphNode {
+    const validUntilRaw = row.valid_until;
+    const invalidatedByRaw = row.invalidated_by_commit;
     return {
       id: row.id as string,
       label: row.label as string,
@@ -542,6 +592,14 @@ export class GraphStore {
       lastVerified: (row.last_verified as number) ?? 0,
       queryCount: (row.query_count as number) ?? 0,
       metadata: JSON.parse((row.metadata as string) || "{}"),
+      validUntil:
+        validUntilRaw === null || validUntilRaw === undefined
+          ? undefined
+          : (validUntilRaw as number),
+      invalidatedByCommit:
+        invalidatedByRaw === null || invalidatedByRaw === undefined
+          ? undefined
+          : (invalidatedByRaw as string),
     };
   }
 

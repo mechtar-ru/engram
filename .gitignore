@@ -7,3 +7,15 @@ dist/
 **/.DS_Store
 # Claude Code local hook install state — project-local, machine-specific
 .claude/settings.local.json
+# Generated IDE integration artifacts (users create these with engram gen-* commands)
+.aider-context.md
+.context/
+.cursor/
+# Dated benchmark result files (TEMPLATE.csv is tracked for reference)
+bench/results/*.json
+
+# Local planning docs (not published)
+.planning/
+
+# Hyperframes scratch/render directories (per-run intermediates)
+docs/demos/work-*/

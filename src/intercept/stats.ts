@@ -7,6 +7,7 @@
  * any I/O.
  */
 import type { HookLogEntry } from "../intelligence/hook-log.js";
+import { formatThousands } from "../graph/render-utils.js";
 
 /**
  * Averaged token estimate per intercepted Read. This is the difference
@@ -149,7 +150,7 @@ export function formatStatsSummary(summary: HookStatsSummary): string {
 
   if (summary.readDenyCount > 0) {
     lines.push(
-      `Estimated tokens saved: ~${summary.estimatedTokensSaved.toLocaleString()}`
+      `Estimated tokens saved: ~${formatThousands(summary.estimatedTokensSaved)}`
     );
     lines.push(
       `  (${summary.readDenyCount} Read denies × ${ESTIMATED_TOKENS_PER_READ_DENY} tok/deny avg)`

@@ -19,6 +19,8 @@ import { resolve, relative, extname, join, sep } from "node:path";
 import { extractFile } from "./miners/ast-miner.js";
 import { toPosixPath } from "./graph/path-utils.js";
 import { getStore, getDbPath } from "./core.js";
+import { formatThousands } from "./graph/render-utils.js";
+import { findProjectRoot, isValidCwd } from "./intercept/context.js";
 
 /** Extensions the AST miner can handle. */
 const WATCHABLE_EXTENSIONS = new Set([
@@ -44,49 +46,127 @@ function shouldIgnore(relPath: string): boolean {
 }
 
 /**
- * Re-index a single file: delete old nodes, extract new ones, upsert.
- * Returns the count of nodes inserted, or 0 if the file was skipped.
+ * Result of a `syncFile` call.
+ *  - "indexed": file existed and was re-extracted; `count` is nodes inserted.
+ *  - "pruned":  file was missing AND had been previously indexed; `count` is
+ *               the number of nodes removed.
+ *  - "skipped": unsupported extension, ignored directory, directory itself,
+ *               or missing file that was never indexed. `count` is 0.
  */
-async function reindexFile(
+export type SyncResult =
+  | { readonly action: "indexed"; readonly count: number }
+  | { readonly action: "pruned"; readonly count: number }
+  | { readonly action: "skipped"; readonly count: 0 };
+
+/**
+ * Bring the graph in sync with one file path: re-index if it exists, prune
+ * if it doesn't (and was previously indexed). Shared by `engram watch` and
+ * the `engram reindex` CLI subcommand so both have identical semantics.
+ */
+export async function syncFile(
   absPath: string,
   projectRoot: string
-): Promise<number> {
+): Promise<SyncResult> {
   const ext = extname(absPath).toLowerCase();
-  if (!WATCHABLE_EXTENSIONS.has(ext)) return 0;
-  if (!existsSync(absPath)) return 0;
-
-  // Skip directories
-  try {
-    if (statSync(absPath).isDirectory()) return 0;
-  } catch {
-    return 0;
-  }
+  if (!WATCHABLE_EXTENSIONS.has(ext)) return { action: "skipped", count: 0 };
 
   const relPath = toPosixPath(relative(projectRoot, absPath));
-  if (shouldIgnore(relPath)) return 0;
+  if (shouldIgnore(relPath)) return { action: "skipped", count: 0 };
+
+  if (!existsSync(absPath)) {
+    const store = await getStore(projectRoot);
+    try {
+      const prior = store.countBySourceFile(relPath);
+      if (prior === 0) return { action: "skipped", count: 0 };
+      store.deleteBySourceFile(relPath);
+      return { action: "pruned", count: prior };
+    } finally {
+      store.close();
+    }
+  }
+
+  try {
+    if (statSync(absPath).isDirectory()) return { action: "skipped", count: 0 };
+  } catch {
+    return { action: "skipped", count: 0 };
+  }
 
   const store = await getStore(projectRoot);
   try {
-    // Remove old nodes/edges for this file
     store.deleteBySourceFile(relPath);
-
-    // Re-extract
     const { nodes, edges } = extractFile(absPath, projectRoot);
-
-    // Upsert new nodes/edges
     if (nodes.length > 0 || edges.length > 0) {
       store.bulkUpsert(nodes, edges);
     }
-
-    return nodes.length;
+    return { action: "indexed", count: nodes.length };
   } finally {
     store.close();
+  }
+}
+
+/**
+ * Format the CLI output line for a `SyncResult`. Returns `null` for
+ * skipped results so the caller can stay silent (AC 4 in #8 — safe to
+ * fire as a PostToolUse hook on every edit without producing noise).
+ */
+export function formatReindexLine(
+  result: SyncResult,
+  displayPath: string
+): string | null {
+  if (result.action === "indexed") {
+    return `engram: reindexed ${displayPath} (${formatThousands(result.count)} nodes)`;
+  }
+  if (result.action === "pruned") {
+    return `engram: pruned ${displayPath} (${formatThousands(result.count)} nodes)`;
+  }
+  return null;
+}
+
+/**
+ * Run the optional auto-reindex PostToolUse hook: parse a Claude Code
+ * payload, resolve the project root from `cwd`, and sync the file at
+ * `tool_input.file_path`. Never throws — every error path resolves to
+ * a silent no-op so the hook can never fail Claude Code's tool cycle
+ * (maintainer's contract on #8).
+ *
+ * Accepts `unknown` because stdin has not yet been validated. Returns
+ * nothing; the effect is a graph mutation (or no-op).
+ */
+export async function runReindexHook(payload: unknown): Promise<void> {
+  try {
+    if (payload === null || typeof payload !== "object") return;
+    const p = payload as {
+      cwd?: unknown;
+      tool_input?: unknown;
+    };
+
+    const cwd = p.cwd;
+    if (typeof cwd !== "string" || !isValidCwd(cwd)) return;
+
+    const toolInput = p.tool_input;
+    if (toolInput === null || typeof toolInput !== "object") return;
+    const filePath = (toolInput as Record<string, unknown>).file_path;
+    if (typeof filePath !== "string" || filePath.length === 0) return;
+
+    // Resolve the file against cwd when it's relative, then walk UP from
+    // the file's location — not cwd. A Claude Code session cwd may sit
+    // above (or beside) the engram-initialized project that owns the
+    // edited file (e.g. multi-project parent, monorepo subtree).
+    const absPath = resolve(cwd, filePath);
+    const projectRoot = findProjectRoot(absPath);
+    if (projectRoot === null) return;
+
+    await syncFile(absPath, projectRoot);
+  } catch {
+    // Swallow everything — a hook is never allowed to fail.
   }
 }
 
 export interface WatchOptions {
   /** Called when a file is re-indexed. */
   readonly onReindex?: (filePath: string, nodeCount: number) => void;
+  /** Called when a file's nodes are pruned because the file was deleted. */
+  readonly onDelete?: (filePath: string, prunedCount: number) => void;
   /** Called on errors. */
   readonly onError?: (error: Error) => void;
   /** Called when the watcher starts. */
@@ -115,10 +195,9 @@ export function watchProject(
 
   const watcher = watch(root, { recursive: true, signal: controller.signal });
 
-  watcher.on("change", (_eventType, filename) => {
+  const handleEvent = (_eventType: string, filename: unknown): void => {
     if (typeof filename !== "string") return;
 
-    // Normalize the filename to an absolute path
     const absPath = resolve(root, filename);
     const relPath = toPosixPath(relative(root, absPath));
 
@@ -127,7 +206,6 @@ export function watchProject(
     const ext = extname(filename).toLowerCase();
     if (!WATCHABLE_EXTENSIONS.has(ext)) return;
 
-    // Debounce: clear existing timer for this file
     const existing = debounceTimers.get(absPath);
     if (existing) clearTimeout(existing);
 
@@ -136,9 +214,11 @@ export function watchProject(
       setTimeout(async () => {
         debounceTimers.delete(absPath);
         try {
-          const count = await reindexFile(absPath, root);
-          if (count > 0) {
-            options.onReindex?.(relPath, count);
+          const result = await syncFile(absPath, root);
+          if (result.action === "indexed" && result.count > 0) {
+            options.onReindex?.(relPath, result.count);
+          } else if (result.action === "pruned") {
+            options.onDelete?.(relPath, result.count);
           }
         } catch (err) {
           options.onError?.(
@@ -147,7 +227,12 @@ export function watchProject(
         }
       }, DEBOUNCE_MS)
     );
-  });
+  };
+
+  // fs.watch fires "change" for content edits and "rename" for create/delete
+  // (recursive mode, all platforms). Subscribe to both so deletions prune.
+  watcher.on("change", handleEvent);
+  watcher.on("rename", handleEvent);
 
   watcher.on("error", (err) => {
     options.onError?.(err instanceof Error ? err : new Error(String(err)));
